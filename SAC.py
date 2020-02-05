@@ -13,13 +13,12 @@ LR = 3e-4 #1128 3e-4 -- 1e-3
 GAMMA = 0.99
 batch_size = 256
 memory_capacity = 5000000
-state_dim =126
-act_dim = 20
+state_dim =140
+act_dim = 2
 num_agent = 5
 load = False
 random_step = 1000
-steps = 0
-
+net_name = 'actor_1126_1m.pkl'
 def soft_update(target, source, t):
     for target_param, source_param in zip(target.parameters(),
                                           source.parameters()):
@@ -52,10 +51,10 @@ class Actor(nn.Module):
         super(Actor,self).__init__()
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
-        self.f1 = nn.Linear(state_dim,512)
-        self.f2 = nn.Linear(512,512)
-        self.f3 = nn.Linear(512,128)
-        self.f4 = nn.Linear(128,128)
+        self.f1 = nn.Linear(state_dim,1024)
+        self.f2 = nn.Linear(1024,512)
+        self.f3 = nn.Linear(512,512)
+        self.f4 = nn.Linear(512,128)
         self.mean = nn.Linear(128,act_dim)
         self.log_std = nn.Linear(128,act_dim)
 
@@ -109,33 +108,37 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     def __init__(self,state_dim):
         super(Critic,self).__init__()
-        self.f1 = nn.Linear(state_dim,512)
-        self.f2 = nn.Linear(512,128)
-        self.f3 = nn.Linear(128,128)
-        self.f4 = nn.Linear(128,1)
+        self.f1 = nn.Linear(state_dim,1024)
+        self.f2 = nn.Linear(1024,512)
+        self.f3 = nn.Linear(512,256)
+        self.f4 = nn.Linear(256,128)
+        self.f5 = nn.Linear(128,1)
     
     def forward(self,x):
         x = F.relu(self.f1(x))
         x = F.relu(self.f2(x))
         x = F.relu(self.f3(x))
-        x = self.f4(x)
+        x = F.relu(self.f4(x))
+        x = self.f5(x)
 
         return x
 
 class SoftQNetwork(nn.Module):
     def __init__(self,state_dim, act_dim):
         super(SoftQNetwork,self).__init__()
-        self.f1 = nn.Linear(state_dim + act_dim, 512)
-        self.f2 = nn.Linear(512,128)
-        self.f3 = nn.Linear(128,128)
-        self.f4 = nn.Linear(128,1)
+        self.f1 = nn.Linear(state_dim + act_dim, 1024)
+        self.f2 = nn.Linear(1024,512)
+        self.f3 = nn.Linear(512,256)
+        self.f4 = nn.Linear(256,128)
+        self.f5 = nn.Linear(128,1)
 
     def forward(self,state,action):
         x = torch.cat([state,action], -1)
         x = F.relu(self.f1(x))
         x = F.relu(self.f2(x))
         x = F.relu(self.f3(x))
-        x = self.f4(x)
+        x = F.relu(self.f4(x))
+        x = self.f5(x)
 
         return x
 
@@ -155,30 +158,40 @@ class SAC():
         self.steps = 0
         self.random_step = random_step
         self.load = load
+        self.alpha = 0.5
+        self.reward_scale = 20
         self.var = [1.0 for i in range(num_agent)]
 
     def select_action(self,states):
         actions = np.zeros((num_agent,act_dim),dtype = float)
         states = torch.from_numpy(states).cuda().float()
         self.steps += 1
-        if self.steps < self.random_step:
-            for i in range(num_agent):
-                actions[i,:] = random.random()*0.56
-            return actions
-        else:
-            for i in range(num_agent):
+        for i in range(num_agent):
+            if self.load == True:
+                self.actor.load_state_dict(torch.load(net_name))
                 state = states[i,:]
-                mean,log_std = self.actor.forward(state.unsqueeze(0))
-                std = log_std.exp()      
+                mean, log_std = self.actor(state.unsqueeze(0))
+                std = log_std.exp()
                 normal = Normal(0, 1)
                 z      = normal.sample().cuda()
                 action = torch.tanh(mean + std*z)
-                action += torch.from_numpy(np.random.randn(act_dim) * self.var[i]).float().cuda()
-                if self.var[i] > 0.05:
-                    self.var[i] *= 0.999992
-                action  = action.detach().cpu().numpy()
-                actions[i,:] = action[0]
-            return actions
+                actions[i,:] = action.detach().cpu().numpy()
+            else:
+                if self.steps < self.random_step:
+                    actions[i,:] = random.random()
+                else:
+                    state = states[i,:]
+                    mean,log_std = self.actor.forward(state.unsqueeze(0))
+                    std = log_std.exp()      
+                    normal = Normal(0, 1)
+                    z      = normal.sample().cuda()
+                    action = torch.tanh(mean + std*z)
+                    action += torch.from_numpy(np.random.randn(act_dim) * self.var[i]).float().cuda()
+                    if self.var[i] > 0.05:
+                        self.var[i] *= 0.999992
+                    action  = action.detach().cpu().numpy()
+                    actions[i,:] = action[0]
+        return actions
         
         
     def update(self):
@@ -187,7 +200,7 @@ class SAC():
         if self.steps < self.random_step:
             return
         state,action,next_state,reward,done = self.memory.sample(batch_size)
-        reward = reward*10
+        reward = reward*self.reward_scale
         predict_q1 = self.softq1(state,action)
         predict_q2 = self.softq2(state,action)
         predict_v = self.critic(state)
@@ -209,7 +222,7 @@ class SAC():
 
         #Update value function
         predict_new_q_value = torch.min(self.softq1(state,new_action),self.softq2(state,new_action))
-        target_value_func = predict_new_q_value - log_prob
+        target_value_func = predict_new_q_value - log_prob*self.alpha
         value_loss = F.mse_loss(predict_v,target_value_func.detach())
         
         self.critic_optim.zero_grad()
@@ -217,12 +230,14 @@ class SAC():
         self.critic_optim.step()
 
         #Update Policy
-        policy_loss = (log_prob - predict_new_q_value).mean()
+        policy_loss = (self.alpha*log_prob - predict_new_q_value).mean()
 
         self.actor_optim.zero_grad()
         policy_loss.backward()
         self.actor_optim.step()
         soft_update(self.target_cirtic,self.critic,TAU)
+
+
     def step(self,state,action,next_state,reward,done):
         if self.load == True:
             return
